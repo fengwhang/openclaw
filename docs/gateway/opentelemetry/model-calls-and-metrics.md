@@ -29,6 +29,24 @@ request latency separate from full-turn latency. OpenClaw's OTEL model-call
 metrics also include `openclaw.model_call.observation_unit`; the Prometheus
 model-call metrics expose the equivalent `observation_unit` label.
 
+Request-level telemetry also covers native background completions, including
+session titles, Activity recaps, and plugin `runtime.llm.complete` calls.
+Each request records a start and one completion or error with its duration;
+token and cost accounting remains separate in `model.usage`.
+
+Codex app-server turns also emit one `model.response.observed` diagnostic for
+each distinct provider response received during the turn. OpenTelemetry records
+it as an `openclaw.model.response.observed` event on the turn's model-call span,
+with a hashed response identifier and token fields reported by the native
+runtime (`usage_source = native-normalized`, `usage_scope = response`).
+Its timestamp records receipt by OpenClaw, not provider completion. Missing
+usage stays absent, including cache-write counts or totals omitted by the native
+runtime. Uncached input is derived only when every cache component was reported;
+prompt tokens use the native input count. No request duration or tool-to-response relationship is
+inferred. These events do not add token or duration metrics. Aggregate accounting
+continues to use `model.usage`; dropped diagnostic events or missing provider
+usage can leave the response observations incomplete.
+
 ## Claude Code CLI model-call fidelity
 
 Claude Code CLI turns emit one synthetic, turn-level `openclaw.model.call`
@@ -116,8 +134,9 @@ malformed request frames, and HTTP routes.
 | `openclaw.gateway.rpc.queue_wait_ms`     | histogram | Operator start-queue or worker frame-queue wait, when applicable  |
 | `openclaw.gateway.rpc.outcomes`          | counter   | Observations by phase and outcome                                 |
 
-Request and timing metrics have only `openclaw.gateway.rpc.method`: a canonical
-core or worker method name, `other` for plugin methods, or `unknown`. Outcome metrics have
+Request and timing metrics have only `openclaw.gateway.rpc.method`: an exact
+core, worker, or registered plugin method name, `other` for unregistered generic
+requests, or `unknown` for unrecognized dedicated worker RPCs. Outcome metrics have
 only `openclaw.gateway.rpc.phase` and `openclaw.gateway.rpc.outcome`, so errors do
 not multiply every method's series. No request, connection, session, or trace IDs
 appear in metric attributes.
@@ -148,6 +167,25 @@ CPU time or event-loop blocking time.
 Observations use the bounded diagnostic queue. Check
 `openclaw.diagnostic.async_queue.dropped` before treating counts or latency
 distributions as complete during saturation.
+
+### Gateway WebSocket events
+
+| Metric                                     | Type    | Measurement                                                    |
+| ------------------------------------------ | ------- | -------------------------------------------------------------- |
+| `openclaw.gateway.ws.events`               | counter | Outbound event frames accepted by the sender, once per socket  |
+| `openclaw.gateway.ws.event_bytes`          | counter | Encoded UTF-8 bytes of those full JSON frames, once per socket |
+| `openclaw.gateway.ws.operator_connections` | gauge   | Connected authenticated operator sockets                       |
+
+The counters have only `openclaw.gateway.ws.event`: a known protocol event name,
+or `other` for an unrecognized name. The connection gauge has no attributes; it
+updates on connect/disconnect and refreshes every 30 seconds to recover dropped
+snapshots or initialize late-starting exporters.
+Event observations are batched by event name within one event-loop turn; fan-out
+still counts each socket separately. Bytes exclude WebSocket framing and
+compression, and send acceptance does not prove client receipt. No event payload,
+session, user, or connection identifiers are exported. These metrics use the
+same bounded diagnostic queue as Gateway RPC observations; check
+`openclaw.diagnostic.async_queue.dropped` when interpreting traffic totals.
 
 ### Model usage
 
@@ -275,6 +313,10 @@ see [Prometheus event-loop windows](/gateway/prometheus#event-loop-observation-w
 - `openclaw.tool.execution.duration_ms` (histogram, attrs: `gen_ai.tool.name`, `openclaw.toolName`, `openclaw.tool.source`, `openclaw.tool.owner`, `openclaw.tool.params.kind`, plus `openclaw.errorCategory` on errors)
 - `openclaw.tool.execution.blocked` (counter, attrs: `gen_ai.tool.name`, `openclaw.toolName`, `openclaw.tool.source`, `openclaw.tool.owner`, `openclaw.tool.params.kind`, `openclaw.deniedReason`)
 - `openclaw.tool.loop` (counter, attrs: `openclaw.toolName`, `openclaw.loop.level`, `openclaw.loop.action`, `openclaw.loop.detector`, `openclaw.loop.count`, optional `openclaw.loop.paired_tool`; emitted when a repetitive tool-call loop is detected)
+
+Exact string and array parameter lengths are recorded on tool spans, not metric
+labels. This keeps cumulative tool metrics from retaining a separate series for
+every observed length.
 
 ### Exec
 

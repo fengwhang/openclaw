@@ -1,3 +1,5 @@
+import { listen } from "../lib/reactive/listener.ts";
+
 const KEYBOARD_MIN_SHRINK = 80;
 
 function hasKeyboardFocus(): boolean {
@@ -36,7 +38,6 @@ export function connectShellViewport(): () => void {
     return () => {};
   }
   const root = document.documentElement;
-  const events = new AbortController();
   let frame: number | null = null;
   let focusHeight: number | null = null;
   let width = root.clientWidth || window.innerWidth;
@@ -65,11 +66,10 @@ export function connectShellViewport(): () => void {
       root.style.removeProperty("--shell-safe-area-bottom");
     }
 
-    // CSS owns ordinary resizes, browser bars and standalone's large canvas.
-    // In particular, iOS standalone's shorter *layout* viewport is not itself
-    // keyboard occlusion. Compare visual and layout viewports, never lvh.
-    const obscured = nativeScale && layoutHeight - viewport.height >= KEYBOARD_MIN_SHRINK;
-    if (obscured) {
+    // Publish a cap independently of keyboard detection: browser chrome and
+    // standalone viewport-unit mismatches can hide less than 80px. CSS keeps
+    // the smaller dynamic canvas, so this never promotes it to a larger one.
+    if (nativeScale) {
       // A panned caret uses layout coordinates: height alone lifts the footer
       // twice. Insets are consumed by the app's CSS, not subtracted here too.
       root.style.setProperty(
@@ -83,25 +83,22 @@ export function connectShellViewport(): () => void {
   const schedule = () => {
     frame ??= requestAnimationFrame(update);
   };
-  const options = { signal: events.signal };
-  viewport.addEventListener("resize", schedule, options);
-  viewport.addEventListener("scroll", schedule, options);
-  window.addEventListener("resize", schedule, options);
-  window.addEventListener("orientationchange", schedule, options);
-  document.addEventListener(
-    "focusin",
-    () => {
+  const stops = [
+    listen(viewport, "resize", schedule),
+    listen(viewport, "scroll", schedule),
+    listen(window, "resize", schedule),
+    listen(window, "orientationchange", schedule),
+    listen(document, "focusin", () => {
       if (hasKeyboardFocus()) {
         focusHeight ??= viewport.height;
       }
       schedule();
-    },
-    options,
-  );
-  document.addEventListener("focusout", schedule, options);
+    }),
+    listen(document, "focusout", schedule),
+  ];
   update();
   return () => {
-    events.abort();
+    stops.forEach((stop) => stop());
     if (frame !== null) {
       cancelAnimationFrame(frame);
     }

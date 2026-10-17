@@ -1,11 +1,8 @@
 // Qa Lab Matrix tests cover sync behavior.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MatrixQaObservedEvent, MatrixQaRoomEvent } from "./events.js";
-import {
-  createMatrixQaRoomObserver,
-  primeMatrixQaRoom,
-  type MatrixQaRoomEventWaitResult,
-} from "./sync.js";
+import { mockMatrixQaHttp } from "./http.test-support.js";
+import { createMatrixQaRoomObserver, primeMatrixQaRoom } from "./sync.js";
 
 function message(
   eventId: string,
@@ -32,61 +29,21 @@ function syncResponse(
 }
 
 describe("matrix sync helpers", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("primes the Matrix sync cursor without recording observed events", async () => {
     const fetchImpl: typeof fetch = async () => Response.json({ next_batch: "primed-sync-cursor" });
+
+    mockMatrixQaHttp(fetchImpl);
 
     await expect(
       primeMatrixQaRoom({
         accessToken: "token",
         baseUrl: "http://127.0.0.1:28008/",
-        fetchImpl,
       }),
     ).resolves.toBe("primed-sync-cursor");
-  });
-
-  it("returns a typed no-match result while preserving the latest sync token", async () => {
-    const fetchImpl: typeof fetch = async () =>
-      syncResponse([{ ...message("$driver", "hello"), sender: "@driver:matrix-qa.test" }]);
-
-    const observedEvents: MatrixQaObservedEvent[] = [];
-
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(1);
-    let result: MatrixQaRoomEventWaitResult;
-    try {
-      result = await createMatrixQaRoomObserver({
-        accessToken: "token",
-        baseUrl: "http://127.0.0.1:28008/",
-        fetchImpl,
-        observedEvents,
-        since: "start-batch",
-      }).waitForOptionalRoomEvent({
-        predicate: (event) => event.sender === "@sut:matrix-qa.test",
-        roomId: "!room:matrix-qa.test",
-        timeoutMs: 1,
-      });
-    } finally {
-      nowSpy.mockRestore();
-    }
-
-    expect(result).toEqual({
-      matched: false,
-      since: "next-batch-2",
-    });
-    expect(observedEvents).toEqual([
-      {
-        kind: "message",
-        roomId: "!room:matrix-qa.test",
-        eventId: "$driver",
-        sender: "@driver:matrix-qa.test",
-        stateKey: undefined,
-        type: "m.room.message",
-        originServerTs: undefined,
-        body: "hello",
-        formattedBody: undefined,
-        msgtype: "m.text",
-        membership: undefined,
-      },
-    ]);
   });
 
   it("lets a second wait reuse later same-batch events without another /sync", async () => {
@@ -104,16 +61,21 @@ describe("matrix sync helpers", () => {
           },
         }),
         message("$final", "final", {
-          "m.new_content": { body: "final", msgtype: "m.text" },
+          "m.new_content": {
+            body: "final",
+            msgtype: "m.text",
+            "m.relates_to": { rel_type: "m.thread", event_id: "$wrong-root" },
+          },
           "m.relates_to": { rel_type: "m.replace", event_id: "$preview" },
         }),
       ]);
     };
     const observedEvents: MatrixQaObservedEvent[] = [];
+    mockMatrixQaHttp(fetchImpl);
+
     const observer = createMatrixQaRoomObserver({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
       observedEvents,
       since: "start-batch",
     });
@@ -151,10 +113,11 @@ describe("matrix sync helpers", () => {
       calls += 1;
       return syncResponse([message("$main-reply", "main reply")], "!main:matrix-qa.test");
     };
+    mockMatrixQaHttp(fetchImpl);
+
     const observer = createMatrixQaRoomObserver({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
       observedEvents: [],
       since: "start-batch",
     });
@@ -201,10 +164,11 @@ describe("matrix sync helpers", () => {
         message("$notice", "notice", { msgtype: "m.notice" }),
       ]);
     };
+    mockMatrixQaHttp(fetchImpl);
+
     const observer = createMatrixQaRoomObserver({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
       observedEvents: [],
       since: "start-batch",
     });
@@ -271,9 +235,10 @@ describe("matrix sync helpers", () => {
         "recovered-batch",
       );
     };
+    mockMatrixQaHttp(fetchImpl);
+
     const observer = createMatrixQaRoomObserver({
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
       observedEvents: [],
       since: "start-batch",
     });
@@ -304,11 +269,11 @@ describe("matrix sync helpers", () => {
 
   it("preserves terminal sync failures, including unrelated TimeoutErrors", async () => {
     const timeoutError = new DOMException("upstream protocol timeout", "TimeoutError");
+    const http = mockMatrixQaHttp(async () => {
+      throw timeoutError;
+    });
     const observer = createMatrixQaRoomObserver({
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl: async () => {
-        throw timeoutError;
-      },
       observedEvents: [],
       since: "start-batch",
     });
@@ -321,9 +286,10 @@ describe("matrix sync helpers", () => {
       }),
     ).rejects.toBe(timeoutError);
 
+    http.request.mockRestore();
+    mockMatrixQaHttp(async () => Response.json({ error: "invalid access token" }, { status: 401 }));
     const authObserver = createMatrixQaRoomObserver({
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl: async () => Response.json({ error: "invalid access token" }, { status: 401 }),
       observedEvents: [],
       since: "start-batch",
     });
@@ -340,9 +306,8 @@ describe("matrix sync helpers", () => {
     const deadline = new AbortController();
     const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
     const bodyError = new Error("late Matrix response body failure");
-    const observer = createMatrixQaRoomObserver({
-      baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl: async () =>
+    mockMatrixQaHttp(
+      async () =>
         new Response(
           new ReadableStream({
             start(controller) {
@@ -351,6 +316,9 @@ describe("matrix sync helpers", () => {
             },
           }),
         ),
+    );
+    const observer = createMatrixQaRoomObserver({
+      baseUrl: "http://127.0.0.1:28008/",
       observedEvents: [],
       since: "start-batch",
     });

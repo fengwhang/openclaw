@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +38,17 @@ export async function readText(filePath: string | undefined): Promise<string | u
   return filePath ? await fs.readFile(filePath, "utf8").catch(() => undefined) : undefined;
 }
 
+export async function readJsonObject(
+  filePath: string | undefined,
+): Promise<Record<string, unknown>> {
+  const raw = await readText(filePath);
+  try {
+    return raw ? asNonArrayRecord(JSON.parse(raw)) : {};
+  } catch {
+    return {};
+  }
+}
+
 export function parseEnv(content: string | undefined): Record<string, string> {
   return content ? parseDotenv(content) : {};
 }
@@ -45,29 +57,19 @@ export function parseHermesConfig(content: string | undefined): Record<string, u
   return content ? asNonArrayRecord(parseYaml(content)) : {};
 }
 
-export function childRecord(
-  root: Record<string, unknown> | undefined,
-  key: string,
-): Record<string, unknown> {
-  const value = root?.[key];
-  return asNonArrayRecord(value);
-}
-
-export function readStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "");
-}
-
 export async function appendItem(item: MigrationItem): Promise<MigrationItem> {
   if (!item.source || !item.target) {
     return markMigrationItemError(item, MIGRATION_REASON_MISSING_SOURCE_OR_TARGET);
   }
   try {
-    const content = await fs.readFile(item.source, "utf8");
+    const content = await fs.readFile(item.source);
+    if (!isUtf8(content)) {
+      throw new Error(
+        `Source file is not valid UTF-8: ${item.source}. Re-encode it as UTF-8 and retry migration.`,
+      );
+    }
     const header = `\n\n<!-- Imported from Hermes: ${path.basename(item.source)} -->\n\n`;
-    const body = content.trimEnd();
+    const body = content.toString("utf8").trimEnd();
     if (!body) {
       return markMigrationItemSkipped(item, "source file is empty");
     }

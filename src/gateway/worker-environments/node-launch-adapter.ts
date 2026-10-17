@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
+import { NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { isAgentRunRestartAbortReason } from "../../agents/run-termination.js";
 import { computeBackoff, sleepWithAbort } from "../../infra/backoff.js";
 import {
@@ -9,9 +10,10 @@ import {
   NODE_WORKER_SUPERVISOR_STATUS_COMMAND,
 } from "../../infra/node-commands.js";
 import {
-  formatNodeRunnerUpdateRequired,
+  createNodeRunnerInventoryIssueError,
   NODE_RUNNER_UPDATE_REQUIRED_ISSUE,
   NODE_WORKER_ENVIRONMENT_SESSION_VERSION,
+  NODE_WORKER_INFERENCE_SETUP_ERROR,
   NODE_WORKER_STATUS_WAIT_VERSION,
   resolveNodeWorkerExecutionIssue,
 } from "../../infra/node-runner-inventory.js";
@@ -19,7 +21,6 @@ import { getGatewayRestartDrainSignal } from "../../process/gateway-work-admissi
 import {
   nodeWorkerPlanHash,
   NODE_WORKER_STATUS_WAIT_MAX_MS,
-  parseNodeWorkerLaunchInput,
   parseNodeWorkerSupervisorReceipt,
   type NodeWorkerLaunchInput,
   type NodeWorkerSupervisorIdentity,
@@ -30,6 +31,7 @@ import {
   parseWorkerAdmissionDeadlineResult,
   WORKER_ADMISSION_DEADLINE_MS,
 } from "../../worker/worker-connection-contract.js";
+import { WorkerNodeLostError } from "../../worker/worker-node-loss.js";
 import { measureWorkerProcessTurnBytes } from "../../worker/worker-process-protocol.js";
 import { buildNodeInvokeRequest, serializeNodeEvent } from "../node-invoke-request.js";
 import type {
@@ -37,8 +39,26 @@ import type {
   NodeWorkerSupervisorTransport,
 } from "../node-registry-private.js";
 import { raceNodeWorkerOperation } from "./node-worker-abort.js";
-import { WorkerRunnerCapacityError, WorkerRunnerUnavailableError } from "./tunnel-contract.js";
+import {
+  WorkerRunnerCapacityError,
+  WorkerRunnerUnavailableError,
+  type WorkerTurnProcessResult,
+} from "./tunnel-contract.js";
 import { boundedWorkerError } from "./worker-error.js";
+
+export function nodeWorkerSpawnResultFromReceipt(
+  receipt: TerminalNodeWorkerSupervisorReceipt,
+): WorkerTurnProcessResult {
+  return {
+    ...(receipt.state === "interrupted" ? { nodeLoss: new WorkerNodeLostError() } : {}),
+    stdout: receipt.state === "completed" ? receipt.resultJson : "",
+    stderr: receipt.state === "completed" ? "" : receipt.errorText,
+    code: receipt.state === "completed" ? 0 : 1,
+    signal: null,
+    killed: receipt.state === "cancelled" || receipt.state === "interrupted",
+    termination: "exit",
+  };
+}
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
@@ -106,16 +126,6 @@ function isTerminalReceipt(
   return receipt.state !== "pending" && receipt.state !== "running";
 }
 
-function snapshotLaunchInput(input: NodeWorkerLaunchInput): NodeWorkerLaunchInput {
-  let encoded: string;
-  try {
-    encoded = JSON.stringify(input);
-  } catch {
-    throw new Error("node worker launch input is not serializable");
-  }
-  return parseNodeWorkerLaunchInput(encoded);
-}
-
 function rearmNodeWorkerLaunchInput(
   input: NodeWorkerLaunchInput,
   attempt: number,
@@ -134,10 +144,15 @@ function rearmNodeWorkerLaunchInput(
 }
 
 export function measureNodeWorkerLaunchBytes(nodeId: string, input: NodeWorkerLaunchInput): number {
+  const measured = input.descriptor.admission.handshake.protocolFeatures.includes(
+    NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE,
+  )
+    ? { ...input, idleRetention: true as const }
+    : input;
   // Re-arms replace a UUID with a SHA-256 hex turn ID. Measure both without changing
   // the original plan; the registry bounds timeouts and always generates UUID request IDs.
   return Math.max(
-    ...[input, rearmNodeWorkerLaunchInput(input, 1)].flatMap((attempt) => [
+    ...[measured, rearmNodeWorkerLaunchInput(measured, 1)].flatMap((attempt) => [
       Buffer.byteLength(
         serializeNodeEvent(
           "node.invoke.request",
@@ -152,7 +167,7 @@ export function measureNodeWorkerLaunchBytes(nodeId: string, input: NodeWorkerLa
         ),
         "utf8",
       ),
-      measureWorkerProcessTurnBytes(attempt.descriptor),
+      measureWorkerProcessTurnBytes(attempt.descriptor, attempt.idleRetention),
     ]),
   );
 }
@@ -289,6 +304,8 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
     isAuthorized: () => boolean;
     deadline: OperationDeadline;
     onDispatchReady?: () => void;
+    idleRetention?: true;
+    prepareLaunch?: (node: NodeWorkerSupervisorNodeProof) => void;
   }): Promise<{ receipt: NodeWorkerSupervisorReceipt | null; statusWait: boolean }> => {
     if (!params.isAuthorized()) {
       throw new NodeWorkerLaunchTransportError(
@@ -329,8 +346,13 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
         (node.workerHost.environmentSession !== NODE_WORKER_ENVIRONMENT_SESSION_VERSION ||
           resolveNodeWorkerExecutionIssue(node.workerHost))
       ) {
-        throw new Error(
-          formatNodeRunnerUpdateRequired(node.nodeId, NODE_RUNNER_UPDATE_REQUIRED_ISSUE),
+        throw createNodeRunnerInventoryIssueError(node.nodeId, NODE_RUNNER_UPDATE_REQUIRED_ISSUE);
+      }
+      params.prepareLaunch?.(node);
+      if (!params.prepareLaunch && params.idleRetention && node.workerHost.idleRetention !== true) {
+        throw new NodeWorkerLaunchTransportError(
+          "PRIVATE_DIALECT_UNAVAILABLE",
+          "node worker idle retention is unavailable",
         );
       }
       // A retained environment already owns its slot. The node arbitrates new physical
@@ -384,17 +406,14 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
     }
   };
 
-  const waitBeforeRetry = async (params: {
-    delayMs: number;
-    deadline: OperationDeadline;
-  }): Promise<number> => {
-    const remainingMs = params.deadline.remainingMs();
-    params.deadline.signal.throwIfAborted();
+  const waitBeforeRetry = async (delayMs: number, deadline: OperationDeadline): Promise<number> => {
+    const remainingMs = deadline.remainingMs();
+    deadline.signal.throwIfAborted();
     await raceNodeWorkerOperation(
-      sleep(Math.min(params.delayMs, remainingMs), params.deadline.signal),
-      params.deadline.signal,
+      sleep(Math.min(delayMs, remainingMs), deadline.signal),
+      deadline.signal,
     );
-    return Math.min(params.delayMs * 2, MAX_RETRY_DELAY_MS);
+    return Math.min(delayMs * 2, MAX_RETRY_DELAY_MS);
   };
 
   const cancelUntilTerminal = async (params: {
@@ -438,7 +457,7 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
             throw error;
           }
         }
-        delayMs = await waitBeforeRetry({ delayMs, deadline });
+        delayMs = await waitBeforeRetry(delayMs, deadline);
       }
     } finally {
       deadline.dispose();
@@ -452,7 +471,8 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
     request: DeviceWorkerLaunchRequest,
   ): Promise<TerminalNodeWorkerSupervisorReceipt> => {
     const restartSignal = getGatewayRestartDrainSignal();
-    const originalInput = snapshotLaunchInput(request.input);
+    // The tunnel owns the prepared descriptor; only negotiated launch options change here.
+    const originalInput = { ...request.input };
     let input = originalInput;
     const stableRequest = { ...request, input };
     let expected = expectedIdentity(input);
@@ -502,13 +522,37 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
               ? NODE_WORKER_SUPERVISOR_STATUS_COMMAND
               : NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND,
             payload: pollStatus ? { launchId: input.launchId } : input,
-            isAuthorized: () => {
+            ...(!pollStatus && input.idleRetention ? { idleRetention: true as const } : {}),
+            ...(!pollStatus && !mayHaveLaunched
+              ? {
+                  prepareLaunch: (node: NodeWorkerSupervisorNodeProof) => {
+                    if (
+                      input.descriptor.assignment.inference === "runtime-local" &&
+                      node.workerHost.nativeInference !== 1
+                    ) {
+                      throw new Error(NODE_WORKER_INFERENCE_SETUP_ERROR);
+                    }
+                    if (
+                      node.workerHost.idleRetention === true &&
+                      input.descriptor.admission.handshake.protocolFeatures.includes(
+                        NODE_WORKER_IDLE_RETENTION_PROTOCOL_FEATURE,
+                      )
+                    ) {
+                      input.idleRetention = true;
+                    } else {
+                      delete input.idleRetention;
+                    }
+                    expected = expectedIdentity(input);
+                  },
+                }
+              : {}),
+            isAuthorized: Object.assign(() => {
               if (!dispatchReady) {
                 // Publish expiry through the signal; a guard throw can orphan the invoke promise.
                 availabilityDeadline.remainingMs();
               }
               return stableRequest.isDispatchAuthorized();
-            },
+            }, stableRequest.isDispatchAuthorized),
             deadline: dispatchDeadline,
             ...(!pollStatus
               ? {
@@ -545,10 +589,7 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
                 // The node journal holds this attempt's reason and proves its child
                 // is gone. Re-arm only after backoff and current authority revalidation.
                 mayHaveLaunched = false;
-                await waitBeforeRetry({
-                  delayMs: rearmDelayMs,
-                  deadline,
-                });
+                await waitBeforeRetry(rearmDelayMs, deadline);
                 // Deterministic IDs make a replay of this adapter find the same journal
                 // rows, never another child for an already completed retry.
                 input = rearmNodeWorkerLaunchInput(originalInput, admissionAttempts++);
@@ -595,10 +636,7 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
           }
           pollStatus = false;
         }
-        delayMs = await waitBeforeRetry({
-          delayMs,
-          deadline: dispatchReady ? deadline : availabilityDeadline,
-        });
+        delayMs = await waitBeforeRetry(delayMs, dispatchReady ? deadline : availabilityDeadline);
       }
     } catch (error) {
       if (restartSignal.aborted && isAgentRunRestartAbortReason(deadline.signal.reason)) {
@@ -620,11 +658,16 @@ export function createNodeWorkerLaunchAdapter(options: NodeWorkerLaunchAdapterOp
       try {
         terminal = await cancelUntilTerminal({ request: stableRequest, expected });
       } catch (cancelError) {
-        throw new AggregateError(
+        const failure = new AggregateError(
           [error, cancelError],
           "node worker launch failed and cancellation could not be confirmed",
           { cause: cancelError },
         );
+        throw error instanceof NodeWorkerLaunchTransportError &&
+          (error.code === "DISCONNECTED" || error.code === "NOT_CONNECTED") &&
+          !request.signal?.aborted
+          ? new WorkerNodeLostError({ cause: failure })
+          : failure;
       }
       if (deadline.signal.aborted || !stableRequest.isDispatchAuthorized()) {
         return terminal;

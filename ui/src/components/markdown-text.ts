@@ -1,14 +1,7 @@
+import { t } from "../i18n/index.ts";
+
 const BLOCK_ART_LINE_RE = /^[\t \u00a0▀▄█]+$/u;
 const BLOCK_ART_GLYPH_RE = /[▀▄█]/u;
-
-export function escapeMarkdownHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 export function normalizeMarkdownLineBreaks(value: string): string {
   // Most streamed text already uses LF. Avoid allocating a second full string
@@ -23,20 +16,29 @@ export function isMarkdownBlockArtText(value: string): boolean {
   if (!BLOCK_ART_GLYPH_RE.test(value)) {
     return false;
   }
-  const lines = normalizeMarkdownLineBreaks(value).split("\n");
-  const artLines = lines.filter((line) => line.trim().length > 0);
-  if (artLines.length < 2) {
-    return false;
-  }
+  const artLines = normalizeMarkdownLineBreaks(value)
+    .split("\n")
+    .filter((line) => line.trim().length > 0);
 
   // QR generators commonly use spaces plus upper/lower/full block glyphs.
   // Require multiple glyph-only lines so ordinary prose with a stray block character stays markdown.
-  let glyphCount = 0;
-  for (const line of artLines) {
-    if (!BLOCK_ART_LINE_RE.test(line) || !BLOCK_ART_GLYPH_RE.test(line)) {
-      return false;
-    }
-    glyphCount += Array.from(line).filter((char) => BLOCK_ART_GLYPH_RE.test(char)).length;
-  }
-  return glyphCount >= 8;
+  return (
+    artLines.length >= 2 &&
+    artLines.every((line) => BLOCK_ART_LINE_RE.test(line) && BLOCK_ART_GLYPH_RE.test(line)) &&
+    value.match(/[▀▄█]/gu)!.length >= 8
+  );
+}
+
+export function appendMarkdownTruncationNotice(truncated: {
+  text: string;
+  truncated: boolean;
+  total: number;
+}): string {
+  const notice = truncated.truncated
+    ? `\n\n${t("chat.markdown.truncated", {
+        total: String(truncated.total),
+        shown: String(truncated.text.length),
+      })}`
+    : "";
+  return `${truncated.text}${notice}`;
 }

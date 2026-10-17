@@ -81,4 +81,32 @@ describe("Control UI lazy LaTeX rendering", () => {
     document.body.append(retired);
     expect(retired.querySelector(".katex")).toBe(rendered);
   });
+  it("keeps both ends of wide display math reachable inside a narrow host", async () => {
+    const source =
+      "$$" + Array.from({ length: 35 }, (_, index) => "x_{" + index + "}").join("+") + "$$";
+    const host = mount(source);
+    host.style.width = "180px";
+    await typeset(host);
+    const leaf = host.querySelector<HTMLElement>(leafTag)!;
+    const scroller = [leaf, ...leaf.querySelectorAll<HTMLElement>("*")].find(
+      (element) =>
+        /^(auto|scroll)$/.test(getComputedStyle(element).overflowX) &&
+        element.clientWidth > 0 &&
+        element.scrollWidth > element.clientWidth,
+    );
+    expect(scroller, "wide math needs a local horizontal reading surface").toBeDefined();
+    const readingSurface = scroller!;
+    expect(readingSurface.getBoundingClientRect().width).toBeLessThanOrEqual(180);
+    const groups = leaf.querySelectorAll<HTMLElement>(".katex-html > .base");
+    expect(groups.length).toBeGreaterThan(0);
+    readingSurface.scrollLeft = 0;
+    expect(groups[0]!.getBoundingClientRect().left).toBeGreaterThanOrEqual(
+      readingSurface.getBoundingClientRect().left - 1,
+    );
+    readingSurface.scrollLeft = readingSurface.scrollWidth;
+    expect(readingSurface.scrollLeft).toBeGreaterThan(0);
+    expect(groups[groups.length - 1]!.getBoundingClientRect().right).toBeLessThanOrEqual(
+      readingSurface.getBoundingClientRect().right + 1,
+    );
+  });
 });

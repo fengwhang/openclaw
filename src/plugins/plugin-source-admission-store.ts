@@ -1,28 +1,55 @@
-import { isArtifactPreservingStateRead } from "../state/openclaw-state-db-readonly.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { isArtifactPreservingStateRead } from "../state/artifact-preserving-state-reads.js";
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { resolveInstalledPluginIndexStateDatabaseOptions } from "./installed-plugin-index-store-path.js";
 import type { PluginSourceAdmissionPublication } from "./plugin-source-admission.types.js";
 
-/** Publish native admission facts without replacing the running metadata snapshot. */
-export async function publishPluginSourceAdmission(
-  params: PluginSourceAdmissionPublication & { env?: NodeJS.ProcessEnv; stateDir?: string },
-): Promise<boolean> {
+type AdmissionPublisher = (publication: PluginSourceAdmissionPublication) => Promise<boolean>;
+const publisherContext = new AsyncLocalStorage<AdmissionPublisher>();
+
+/** Application workers delegate publication to the original host-owned state authority. */
+export function withPluginSourceAdmissionPublisher<T>(
+  publisher: AdmissionPublisher,
+  run: () => T,
+): T {
+  return publisherContext.run(publisher, run);
+}
+
+/** Deferred publication retains its original store and authority through settlement. */
+export function createPluginSourceAdmissionPublisher(
+  options: { env?: NodeJS.ProcessEnv; stateDir?: string } = {},
+): ((publication: PluginSourceAdmissionPublication) => Promise<boolean>) | undefined {
   if (isArtifactPreservingStateRead()) {
-    return false;
+    return undefined;
   }
-  const { env, stateDir, ...publication } = params;
-  const prepared = structuredClone(publication);
-  const context = captureOpenClawStateWorkerContext(
-    resolveInstalledPluginIndexStateDatabaseOptions({ env, stateDir }),
-  );
-  const { runOpenClawStateWorkerOperation } =
-    await import("../state/openclaw-state-worker-store.js");
-  return (
-    (await runOpenClawStateWorkerOperation(
-      context,
-      (scope) =>
-        scope.execute({ type: "plugins.metadata.sourceAdmission.publish", input: prepared }),
-      { existingOnly: true },
-    )) ?? false
-  );
+  const delegated = publisherContext.getStore();
+  if (delegated) {
+    return delegated;
+  }
+  let context: ReturnType<typeof captureOpenClawStateWorkerContext>;
+  try {
+    context = captureOpenClawStateWorkerContext(
+      resolveInstalledPluginIndexStateDatabaseOptions(options),
+    );
+  } catch (error) {
+    // Persistence remains advisory; a later retry cannot acquire replacement authority.
+    return async () => {
+      throw error;
+    };
+  }
+  return async (publication) => {
+    if (isArtifactPreservingStateRead()) {
+      return false;
+    }
+    const { runOpenClawStateWorkerOperation } =
+      await import("../state/openclaw-state-worker-store.js");
+    return (
+      (await runOpenClawStateWorkerOperation(
+        context,
+        (scope) =>
+          scope.execute({ type: "plugins.metadata.sourceAdmission.publish", input: publication }),
+        { existingOnly: true },
+      )) ?? false
+    );
+  };
 }

@@ -1,8 +1,9 @@
 import {
   createAdmittedRunOperatorAuthority,
-  createOperationalRunInstanceRef,
   getAdmittedRunDelegatedAuthority,
-  prepareAgentRunAdmission,
+  prepareSystemAgentRunAdmission,
+  type AdmittedRunContext,
+  type AdmittedRunOperatorAuthority,
 } from "../../agents/admitted-run-context.js";
 import type { EmbeddedAgentQueueHandle } from "../../agents/embedded-agent-runner/run-state.js";
 import {
@@ -17,14 +18,11 @@ import {
   withGatewayPersonalToolUser,
 } from "../../agents/tools/gateway-caller-context.js";
 import type { AgentRuntimeIdentity } from "../../gateway/agent-runtime-identity-token.js";
-import type { GatewayClient } from "../../gateway/server-methods/types.js";
+import type { GatewayClient, GatewayContextResolver } from "../../gateway/server-methods/types.js";
 import type { GatewayUiCommandTarget } from "../../gateway/ui-command-target.types.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
-import type {
-  ReplyBackendQueueMessageOptions,
-  ReplyMessageInjectionOutcome,
-} from "./reply-run-registry.contracts.js";
+import type { ReplyMessageInjectionOutcome } from "./reply-run-registry.contracts.js";
 import {
   createTestReplyOperation,
   queueCurrentReplyRunMessage,
@@ -113,11 +111,23 @@ type Person = {
   profileId: string;
   senderId: string;
   name: string;
+  operatorAuthority?: AdmittedRunOperatorAuthority;
+  readCurrentRoleAssignment?: () => string | null;
   gatewayUiCommandTarget?: GatewayUiCommandTarget;
 };
+type PreparedRun = Pick<EmbeddedAgentQueueHandle, "toolAuthorityFingerprint">;
 
 export async function withPersonalToolTurn<T>(
-  params: { owner: Person; backendKind?: "embedded" | "cli"; hiddenQuestion?: boolean },
+  params: {
+    owner: Person;
+    backendKind?: "embedded" | "cli";
+    hiddenQuestion?: boolean;
+    sessionKey?: string;
+    sessionId?: string;
+    runId?: string;
+    admittedRunContext?: AdmittedRunContext;
+    gatewayContextResolver?: GatewayContextResolver;
+  },
   test: (turn: {
     steer(
       person: Person,
@@ -126,6 +136,7 @@ export async function withPersonalToolTurn<T>(
     revoke(profileId: string): void;
     complete(): void;
     operation: ReturnType<typeof createTestReplyOperation>;
+    admittedRunContext: AdmittedRunContext;
     runtimeIdentity: AgentRuntimeIdentity;
     releaseCounts: Map<string, number>;
   }) => Promise<T>,
@@ -133,13 +144,16 @@ export async function withPersonalToolTurn<T>(
   const revoked = new Set<string>();
   const releaseCounts = new Map<string, number>();
   const run = createQueueTestRun({ prompt: "Arrange my view" });
+  const queued = run.run;
   const modelPolicy = prepareOperatorModelPolicy({ cfg: {}, policy: {} });
   const authority = (person: Person, scopes = ["operator.read", "operator.write"]) =>
+    person.operatorAuthority ??
     createAdmittedRunOperatorAuthority({
       profileId: person.profileId,
       scopes,
       gatewayAccessGrant: null,
       modelPolicy,
+      readCurrentRoleAssignment: person.readCurrentRoleAssignment,
       assertCurrent() {
         if (revoked.has(person.profileId)) {
           throw new Error("Profile access revoked");
@@ -149,10 +163,10 @@ export async function withPersonalToolTurn<T>(
         releaseCounts.set(person.profileId, (releaseCounts.get(person.profileId) ?? 0) + 1),
     });
   run.operatorAuthority = authority(params.owner);
-  Object.assign(run.run, {
+  Object.assign(queued, {
     agentId: "main",
-    sessionKey: "agent:main:personal-tools",
-    sessionId: "personal-tools",
+    sessionKey: params.sessionKey ?? "agent:main:personal-tools",
+    sessionId: params.sessionId ?? "personal-tools",
     senderId: params.owner.senderId,
     senderName: params.owner.name,
     senderIsOwner: true,
@@ -160,152 +174,147 @@ export async function withPersonalToolTurn<T>(
     gatewayUiCommandTarget: params.owner.gatewayUiCommandTarget,
   });
   const operation = createTestReplyOperation({
-    sessionKey: run.run.sessionKey,
-    sessionId: run.run.sessionId,
+    sessionKey: queued.sessionKey,
+    sessionId: queued.sessionId,
   });
-  operation.bindToolAuthoritySnapshot(prepareReplyToolAuthority(run));
-  const runId = "personal-tool-run";
-  const admission = prepareAgentRunAdmission({
-    cfg: {},
-    operationalRunInstance: createOperationalRunInstanceRef(runId),
-    operatorAuthority: run.operatorAuthority,
-    facts: {
-      agentId: "main",
-      runId,
-      ingress: { kind: "system", state: "present", boundary: "personal-tool-test" },
-    },
-  });
+  await operation.bindToolAuthoritySnapshotAsync(prepareReplyToolAuthority(run));
+  const runId = params.runId ?? "personal-tool-run";
+  const admission = params.admittedRunContext
+    ? undefined
+    : prepareSystemAgentRunAdmission(
+        {},
+        runId,
+        "main",
+        "personal-tool-test",
+        undefined,
+        run.operatorAuthority,
+      );
   let reject = false;
   let registeredHandle: EmbeddedAgentQueueHandle | undefined;
   try {
-    const admittedRunContext = await admission.admit("embedded", "personal-tool-test");
+    const admittedRunContext =
+      params.admittedRunContext ?? (await admission!.admit("embedded", "personal-tool-test"));
     const delegatedAuthority = getAdmittedRunDelegatedAuthority(admittedRunContext);
     if (!delegatedAuthority) {
       throw new Error("The test turn was not admitted");
     }
-    const runtimeIdentity: AgentRuntimeIdentity = {
-      kind: "agentRuntime",
+    const caller = {
       agentId: "main",
-      sessionKey: run.run.sessionKey!,
+      sessionKey: queued.sessionKey!,
       operationalRunInstance: admittedRunContext.operationalRunInstance,
-      delegatedAuthority: { ...delegatedAuthority, kind: "local" },
       gatewayUiCommandTarget: params.owner.gatewayUiCommandTarget,
+    };
+    const runtimeIdentity: AgentRuntimeIdentity = {
+      ...caller,
+      kind: "agentRuntime",
+      delegatedAuthority: { ...delegatedAuthority, kind: "local" },
+    };
+    const runPrepared = async ({ toolAuthorityFingerprint }: PreparedRun) => {
+      const handle = createEmbeddedRunHandle({ runId, toolAuthorityFingerprint });
+      handle.messageInjectionV2 = {
+        version: 2,
+        isAvailable: () => true,
+        queueMessage: async (_text, options, assertCurrent) => {
+          assertCurrent();
+          if (params.hiddenQuestion) {
+            throw new Error("Hidden input must claim its pending question");
+          }
+          if (reject) {
+            throw new Error("Runtime declined steering");
+          }
+          options?.onQueueAccepted?.(true);
+        },
+      };
+      if (params.hiddenQuestion) {
+        handle.messageInjectionV2.claimPendingUserInputAnswer = async (
+          _text,
+          _options,
+          assertCurrent,
+        ) => {
+          assertCurrent();
+          return !reject;
+        };
+      }
+      const backend = { ...handle, kind: params.backendKind ?? "embedded", cancel() {} };
+      operation.attachBackend(backend);
+      if (backend.kind === "embedded") {
+        const embeddedBackend = { ...backend, kind: "embedded" as const };
+        registeredHandle = embeddedBackend;
+        setActiveEmbeddedRun(
+          queued.sessionId,
+          embeddedBackend,
+          queued.sessionKey,
+          queued.sessionFile,
+          "main",
+        );
+      }
+      operation.setPhase("running");
+      if (params.hiddenQuestion) {
+        registerAgentRunContext(runId, {
+          isControlUiVisible: false,
+          projectSessionMessages: false,
+        });
+      }
+      return await test({
+        operation,
+        admittedRunContext,
+        runtimeIdentity,
+        releaseCounts,
+        complete: () => operation.complete(),
+        revoke: (profileId) => {
+          revoked.add(profileId);
+        },
+        steer: async (person, options) => {
+          reject = options?.reject === true;
+          return await queueCurrentReplyRunMessage(queued.sessionId, "Change my view", {
+            isInboundUserMessage: true,
+            toolAuthorityOverlay: {
+              operatorAuthority: authority(person, options?.scopes),
+              senderId: person.senderId,
+              senderName: person.name,
+              senderIsOwner: true,
+              disableTools: false,
+              traceAuthorized: false,
+              clientCaps: queued.clientCaps,
+              gatewayUiCommandTarget: person.gatewayUiCommandTarget,
+            },
+          });
+        },
+      });
     };
     return await withGatewayToolCallerIdentity(
       {
-        agentId: "main",
-        sessionKey: run.run.sessionKey!,
+        ...caller,
         operatorAuthority: run.operatorAuthority,
-        operationalRunInstance: admittedRunContext.operationalRunInstance,
-        gatewayUiCommandTarget: params.owner.gatewayUiCommandTarget,
+        gatewayContextResolver: params.gatewayContextResolver,
         receiptAuthority: () => {
-          admission.assertSourceCurrent();
+          if (getAdmittedRunDelegatedAuthority(admittedRunContext) !== delegatedAuthority) {
+            throw new Error("The test turn is no longer admitted");
+          }
         },
       },
       () =>
         withPreparedEmbeddedRunToolAuthority(
           { admittedRunContext, replyOperation: operation },
           {
-            ...run.run,
+            ...queued,
             runId,
-            modelId: run.run.model,
+            modelId: queued.model,
             toolAuthorityFingerprint: operation.toolAuthorityFingerprint,
             abortSignal: operation.abortSignal,
           },
           undefined,
-          async (prepared) => {
-            const handle = createEmbeddedRunHandle({
-              runId,
-              toolAuthorityFingerprint: prepared.toolAuthorityFingerprint,
-            });
-            handle.messageInjectionV2 = {
-              version: 2,
-              isAvailable: () => true,
-              ...(params.hiddenQuestion
-                ? {
-                    claimPendingUserInputAnswer: async (
-                      _text: string,
-                      _options: ReplyBackendQueueMessageOptions | undefined,
-                      assertCurrent: () => void,
-                    ) => {
-                      assertCurrent();
-                      return !reject;
-                    },
-                  }
-                : {}),
-              queueMessage: async (
-                _text: string,
-                options: ReplyBackendQueueMessageOptions | undefined,
-                assertCurrent: () => void,
-              ) => {
-                assertCurrent();
-                if (params.hiddenQuestion) {
-                  throw new Error("Hidden input must claim its pending question");
-                }
-                if (reject) {
-                  throw new Error("Runtime declined steering");
-                }
-                options?.onQueueAccepted?.(true);
-              },
-            };
-            const backend =
-              params.backendKind === "cli"
-                ? { ...handle, kind: "cli" as const, cancel() {} }
-                : { ...handle, kind: "embedded" as const, cancel() {} };
-            operation.attachBackend(backend);
-            if (backend.kind === "embedded") {
-              registeredHandle = backend;
-              setActiveEmbeddedRun(
-                run.run.sessionId,
-                backend,
-                run.run.sessionKey,
-                run.run.sessionFile,
-                "main",
-              );
-            }
-            operation.setPhase("running");
-            if (params.hiddenQuestion) {
-              registerAgentRunContext(runId, {
-                isControlUiVisible: false,
-                projectSessionMessages: false,
-              });
-            }
-            return await test({
-              operation,
-              runtimeIdentity,
-              releaseCounts,
-              complete: () => operation.complete(),
-              revoke: (profileId) => {
-                revoked.add(profileId);
-              },
-              steer: async (person, options) => {
-                reject = options?.reject === true;
-                return await queueCurrentReplyRunMessage(run.run.sessionId, "Change my view", {
-                  isInboundUserMessage: true,
-                  toolAuthorityOverlay: {
-                    operatorAuthority: authority(person, options?.scopes),
-                    senderId: person.senderId,
-                    senderName: person.name,
-                    senderIsOwner: true,
-                    disableTools: false,
-                    traceAuthorized: false,
-                    clientCaps: run.run.clientCaps,
-                    gatewayUiCommandTarget: person.gatewayUiCommandTarget,
-                  },
-                });
-              },
-            });
-          },
+          runPrepared,
         ),
     );
   } finally {
     if (registeredHandle) {
-      clearActiveEmbeddedRun(run.run.sessionId, registeredHandle, run.run.sessionKey);
+      clearActiveEmbeddedRun(queued.sessionId, registeredHandle, queued.sessionKey);
     }
     if (params.hiddenQuestion) {
       clearAgentRunContext(runId);
     }
     operation.complete();
-    admission.close();
+    admission?.close();
   }
 }

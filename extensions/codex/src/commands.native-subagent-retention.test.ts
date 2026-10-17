@@ -1,20 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  clearRuntimeAuthProfileStoreSnapshots,
-  resolveDefaultAgentDir,
-} from "openclaw/plugin-sdk/agent-runtime";
+import { resolveDefaultAgentDir } from "openclaw/plugin-sdk/agent-runtime";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
-import type { PluginCommandContext } from "openclaw/plugin-sdk/plugin-entry";
-import {
-  clearSessionStoreCacheForTest,
-  upsertSessionEntry,
-} from "openclaw/plugin-sdk/session-store-runtime";
-import {
-  closeOpenClawAgentDatabasesAsync,
-  closeOpenClawStateDatabaseAsync,
-} from "openclaw/plugin-sdk/sqlite-runtime-testing";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   consumeCodexAppServerLiveThread,
   hasCodexAppServerLiveThread,
@@ -23,6 +11,7 @@ import {
 } from "./app-server/client-runtime.js";
 import { CodexAppServerClient } from "./app-server/client.js";
 import { threadStartResult } from "./app-server/codex-app-server.test-fixtures.js";
+import type { CodexPluginConfig } from "./app-server/config.js";
 import { codexNativeSubagentMonitorRuntime } from "./app-server/native-subagent-monitor.js";
 import { nativeCompletionNotification } from "./app-server/native-subagent-monitor.test-support.js";
 import { isJsonObject, type CodexServerNotification } from "./app-server/protocol.js";
@@ -35,73 +24,32 @@ import { createCodexSqliteTestBindingStateStore } from "./app-server/session-bin
 import {
   getLeasedSharedCodexAppServerClient,
   releaseLeasedSharedCodexAppServerClient,
-  resetSharedCodexAppServerClientForTests,
 } from "./app-server/shared-client.js";
-import { createClientHarness, useAutoCleanupTempDirTracker } from "./app-server/test-support.js";
+import { createClientHarness } from "./app-server/test-support.js";
+import { createCodexCommandHost } from "./command-host.test-support.js";
 import { createCodexCommand } from "./commands.js";
+import {
+  createContext,
+  createCodexRuntimeContextOverrides,
+  useCodexCommandTestState,
+} from "./commands.test-support.js";
 
 let tempDir: string;
 
-function createContext(
-  args: string,
-  overrides: Partial<PluginCommandContext>,
-): PluginCommandContext {
-  return {
-    channel: "test",
-    isAuthorizedSender: true,
-    senderIsOwner: true,
-    senderId: "user-1",
-    args,
-    commandBody: `/codex ${args}`,
-    config: {},
-    sessionId: "session-1",
-    requestConversationBinding: async () => ({ status: "error", message: "unused" }),
-    detachConversationBinding: async () => ({ removed: false }),
-    getCurrentConversationBinding: async () => null,
-    ...overrides,
-  };
-}
-
-async function createCodexRuntimeContextOverrides(sessionKey: string) {
-  const storePath = path.join(tempDir, "codex-runtime-sessions.json");
-  await upsertSessionEntry({
-    storePath,
-    sessionKey,
-    entry: {
-      sessionId: "session-1",
-      updatedAt: Date.now(),
-      agentHarnessId: "codex",
-    },
-  });
-  return {
-    config: { session: { store: storePath } },
-    sessionKey,
-    sessionTarget: { agentId: "main", sessionId: "session-1", sessionKey, storePath },
-  };
-}
-
 describe("codex command", () => {
-  const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
-    afterEach(async () => {
-      resetSharedCodexAppServerClientForTests();
-      await closeOpenClawAgentDatabasesAsync();
-      await closeOpenClawStateDatabaseAsync();
-      clearRuntimeAuthProfileStoreSnapshots();
-      clearSessionStoreCacheForTest();
-      vi.unstubAllEnvs();
-      cleanup();
-    }),
-  );
-
-  beforeEach(() => {
-    tempDir = tempDirs.make("openclaw-codex-native-retention-");
-    vi.stubEnv("OPENCLAW_STATE_DIR", tempDir);
+  useCodexCommandTestState({
+    onSetup: (stateDir) => {
+      tempDir = stateDir;
+    },
   });
 
   it.each(["claimed-successor", "retained-successor"] as const)(
     "delayed native close preserves %s ownership",
     async (scenario) => {
-      const context = await createCodexRuntimeContextOverrides(`agent:main:test:r5:${scenario}`);
+      const context = await createCodexRuntimeContextOverrides(
+        tempDir,
+        `agent:main:test:r5:${scenario}`,
+      );
       const nativeHome = path.join(tempDir, "native-home");
       await fs.mkdir(nativeHome);
       vi.stubEnv("CODEX_HOME", nativeHome);
@@ -129,7 +77,7 @@ describe("codex command", () => {
           homeScope: "user",
           requestTimeoutMs: 10_000,
         },
-      };
+      } satisfies CodexPluginConfig;
       const startedThread = threadStartResult(threadId, "/repo");
       const response = {
         ...startedThread,
@@ -321,8 +269,13 @@ describe("codex command", () => {
         const completionCursor = notifications.length;
         harness.send(closeCompletion);
         await vi.waitFor(() => expect(replyToLoadedSnapshot).toBeTypeOf("function"));
-        const command = createCodexCommand({ pluginConfig, deps: { bindingStore } });
-        const reply = await command.handler(createContext(`resume ${threadId}`, context));
+        const command = createCodexCommand({
+          pluginConfig,
+          deps: createCodexCommandHost({ bindingStore }),
+        });
+        const reply = await command.handler(
+          createContext(`resume ${threadId}`, undefined, context),
+        );
         expect(reply.text).toContain("Attached this OpenClaw session");
         expect(bindingStore.read(identity)).toMatchObject({
           threadId,

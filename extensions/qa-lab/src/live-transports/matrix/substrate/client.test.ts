@@ -1,10 +1,11 @@
 // Qa Lab Matrix tests cover client behavior.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildMatrixQaMessageContent,
   resolveNextRegistrationAuth,
 } from "./client-message-content.js";
 import { createMatrixQaClient, provisionMatrixQaRoom } from "./client.js";
+import { mockMatrixQaHttp } from "./http.test-support.js";
 
 function resolveRequestUrl(input: RequestInfo | URL) {
   if (typeof input === "string") {
@@ -24,6 +25,10 @@ function parseJsonRequestBody(init?: RequestInit) {
 }
 
 describe("matrix driver client", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("omits Matrix HTML markup when the body has no visible mention token", () => {
     expect(
       buildMatrixQaMessageContent({
@@ -51,51 +56,6 @@ describe("matrix driver client", () => {
     ).toThrow("Matrix registration requires unsupported auth stages:");
   });
 
-  it("logs in with Matrix password auth to create a secondary QA device", async () => {
-    const requests: Array<{ body: Record<string, unknown>; url: string }> = [];
-    const fetchImpl: typeof fetch = async (input, init) => {
-      requests.push({
-        body: parseJsonRequestBody(init),
-        url: resolveRequestUrl(input),
-      });
-      return Response.json({
-        access_token: "secondary-token",
-        device_id: "SECONDARYDEVICE",
-        user_id: "@qa-driver:matrix-qa.test",
-      });
-    };
-
-    const client = createMatrixQaClient({
-      baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
-    });
-
-    const login = await client.loginWithPassword({
-      deviceName: "OpenClaw Matrix QA Stale Device",
-      password: "driver-password",
-      userId: "@qa-driver:matrix-qa.test",
-    });
-    expect(login.accessToken).toBe("secondary-token");
-    expect(login.deviceId).toBe("SECONDARYDEVICE");
-    expect(login.password).toBe("driver-password");
-    expect(login.userId).toBe("@qa-driver:matrix-qa.test");
-
-    expect(requests).toEqual([
-      {
-        url: "http://127.0.0.1:28008/_matrix/client/v3/login",
-        body: {
-          type: "m.login.password",
-          identifier: {
-            type: "m.id.user",
-            user: "@qa-driver:matrix-qa.test",
-          },
-          initial_device_display_name: "OpenClaw Matrix QA Stale Device",
-          password: "driver-password",
-        },
-      },
-    ]);
-  });
-
   it("issues Matrix room membership control requests for QA topology changes", async () => {
     const requests: Array<{ body: Record<string, unknown>; url: string }> = [];
     const fetchImpl: typeof fetch = async (input, init) => {
@@ -106,10 +66,11 @@ describe("matrix driver client", () => {
       return Response.json({});
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await client.inviteUserToRoom({
@@ -159,10 +120,11 @@ describe("matrix driver client", () => {
       return Response.json({ event_id: "$reaction-1" });
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await expect(
@@ -185,10 +147,11 @@ describe("matrix driver client", () => {
       return Response.json({ event_id: eventId });
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await expect(
@@ -249,10 +212,11 @@ describe("matrix driver client", () => {
       return Response.json({ event_id: "$media-1" });
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await expect(
@@ -312,10 +276,11 @@ describe("matrix driver client", () => {
         { status: 200, headers: { "content-type": "application/json" } },
       );
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await expect(
@@ -341,10 +306,11 @@ describe("matrix driver client", () => {
         headers: { "content-type": "application/json" },
       });
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await expect(
@@ -368,10 +334,11 @@ describe("matrix driver client", () => {
       return Response.json({ room_id: "!encrypted:matrix-qa.test" });
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const client = createMatrixQaClient({
       accessToken: "token",
       baseUrl: "http://127.0.0.1:28008/",
-      fetchImpl,
     });
 
     await expect(
@@ -465,6 +432,8 @@ describe("matrix driver client", () => {
       throw new Error(`unexpected fetch ${url}`);
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const result = await provisionMatrixQaRoom({
       baseUrl: "http://127.0.0.1:28008/",
       driverLocalpart: "qa-driver",
@@ -472,7 +441,6 @@ describe("matrix driver client", () => {
       registrationToken: "reg-token",
       roomName: "OpenClaw Matrix QA",
       sutLocalpart: "qa-sut",
-      fetchImpl,
       topology: {
         defaultRoomKey: "main",
         rooms: [
@@ -561,6 +529,8 @@ describe("matrix driver client", () => {
       throw new Error(`unexpected fetch ${url}`);
     };
 
+    mockMatrixQaHttp(fetchImpl);
+
     const result = await provisionMatrixQaRoom({
       baseUrl: "http://127.0.0.1:28008/",
       driverLocalpart: "qa-driver",
@@ -568,7 +538,6 @@ describe("matrix driver client", () => {
       registrationToken: "reg-token",
       roomName: "unused",
       sutLocalpart: "qa-sut",
-      fetchImpl,
       topology: {
         defaultRoomKey: "group",
         rooms: [
